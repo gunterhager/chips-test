@@ -14,6 +14,7 @@
 #include "chips/crt.h"
 #include "chips/kbd.h"
 #include "chips/mem.h"
+#include "gdg_whid65040_032.h"
 #include "roms/mz800-roms.h"
 #include "common/gfx.h"
 #include <ctype.h> /* isupper, islower, toupper, tolower */
@@ -30,27 +31,52 @@ typedef struct {
     
     crt_t crt;
     kbd_t kbd;
+    
+    // Memory
     mem_t mem;
-    
-    
+    // ROM
+    uint8_t rom1[0x1000];  // 0x0000-0x0fff
+    uint8_t cgrom[0x1000]; // 0x1000-0x1fff
+    uint8_t rom2[0x2000];  // 0xe000-0xffff
+    // VRAM
+    uint8_t vram[0x4000];  // 0x8000-0xbfff
+    // RAM
+    uint8_t dram0[0x1000]; // 0x0000-0x0fff
+    uint8_t dram1[0x1000]; // 0x1000-0x1fff
+    uint8_t dram2[0x6000]; // 0x2000-0x7fff
+    uint8_t dram3[0x4000]; // 0x8000-0xbfff
+    uint8_t dram4[0x2000]; // 0xc000-0xdfff
+    uint8_t dram5[0x2000]; // 0xe000-0xffff
+
+
+
 } mz800_t;
 mz800_t mz800;
 
-// Memory layout
-const uint32_t mz800_mem_banks[9] = {
-    0x100e0, // R | e0 | x    | CGROM | VRAM | x    |
-    0x100e1, // R | e1 | x    | DRAM  | DRAM | x    |
-    0x000e0, // W | e0 | DRAM | DRAM  | x    | x    |
-    0x000e1, // W | e1 | x    | x     | x    | DRAM |
-    0x000e2, // W | e2 | ROM  | x     | x    | x    |
-    0x000e3, // W | e3 | x    | x     | x    | ROM  |
-    0x000e4, // W | e4 | ROM  | CGROM | VRAM | ROM  |
-    0x000e5, // W | e5 | x    | x     | x    | PROH | // Prohibited
-    0x000e6  // W | e6 | x    | x     | x    | RET  | // Return to previous state
-};
+#define I(a) ((a) | Z80_RD | Z80_IORQ)
+#define O(a) ((a) | Z80_WR | Z80_IORQ)
 
-/// Colors - the MZ-800 has only 16 fixed colors.
+// Memory layout
+// Memory in the ranges 0x2000-0x7fff, 0xc000-0xdfff are always DRAM
+// The memory bank values below can be used directly as bit mask for Z80 pins.
+// | I/O        | 0x0000 | 0x1000 | 0x8000 | 0xe000 |
+// | Address    | 0x0fff | 0x1fff | 0xbfff | 0xffff |
+const uint32_t mz800_mem_banks[9] = {
+    I(0xe0), // | x      | CGROM  | VRAM   | x      |
+    I(0xe1), // | x      | DRAM   | DRAM   | x      |
+    O(0xe0), // | DRAM   | DRAM   | x      | x      |
+    O(0xe1), // | x      | x      | x      | DRAM   |
+    O(0xe2), // | ROM    | x      | x      | x      |
+    O(0xe3), // | x      | x      | x      | ROM    |
+    O(0xe4), // | ROM    | CGROM  | VRAM   | ROM    |
+    O(0xe5), // | x      | x      | x      | PROHIB | // Prohibited
+    O(0xe6)  // | x      | x      | x      | RETURN | // Return to previous state
+};
+#define MEM_BANK_IO_ADDRESS ((uint16_t)0xE7)
+
+/// Colors - the MZ-800 has 16 fixed colors.
 const uint32_t mz800_colors[16] = {
+    // Intensity low
     0x000000, // black
     0x000030, // blue
     0x003000, // red
@@ -59,7 +85,7 @@ const uint32_t mz800_colors[16] = {
     0x300030, // cyan
     0x303000, // yellow
     0x303030, // white
-    
+    // Intensity high
     0x151515, // gray
     0x00003f, // light blue
     0x003f00, // light red
@@ -73,6 +99,12 @@ const uint32_t mz800_colors[16] = {
 
 uint32_t overrun_ticks;
 uint64_t last_time_stamp;
+
+void mz800_init(void);
+void mz800_init_memory_mapping(void);
+void mz800_update_memory_mapping(uint64_t pins);
+uint64_t mz800_cpu_tick(int num_ticks, uint64_t pins);
+uint64_t mz800_cpu_iorq(uint64_t pins);
 
 /* sokol-app entry, configure application callbacks and window */
 void app_init(void);
@@ -95,11 +127,24 @@ sapp_desc sokol_main(int argc, char* argv[]) {
 /* one-time application init */
 void app_init() {
     gfx_init(MZ800_DISP_WIDTH, MZ800_DISP_HEIGHT);
+    mz800_init();
     last_time_stamp = stm_now();
 }
 
 /* per frame stuff, tick the emulator, handle input, decode and draw emulator display */
 void app_frame() {
+    double frame_time = stm_sec(stm_laptime(&last_time_stamp));
+    /* skip long pauses when the app was suspended */
+    if (frame_time > 0.1) {
+        frame_time = 0.1;
+    }
+    uint32_t ticks_to_run = (uint32_t) ((MZ800_FREQ * frame_time) - overrun_ticks);
+    uint32_t ticks_executed = z80_exec(&mz800.cpu, ticks_to_run);
+    assert(ticks_executed >= ticks_to_run);
+    overrun_ticks = ticks_executed - ticks_to_run;
+    // TODO: Keyboard update
+    // kbd_update(&mz800.kbd);
+    gfx_draw();
 }
 
 /* keyboard input handling */
@@ -109,4 +154,96 @@ void app_input(const sapp_event* event) {
 /* application cleanup callback */
 void app_cleanup() {
     gfx_shutdown();
+}
+
+void mz800_init(void) {
+    mz800.tick_count = 0;
+    
+    mz800_init_memory_mapping();
+    z80_init(&mz800.cpu, mz800_cpu_tick);
+    
+    /* CPU start address */
+    mz800.cpu.state.PC = 0x2000;
+}
+
+/**
+ Setup the initial memory mapping with ROM1 and ROM2, the rest is DRAM.
+ */
+void mz800_init_memory_mapping(void) {
+    // TODO: check if the initial setting is correct.
+    mem_map_rom(&mz800.mem, 0, 0x0000, 0x1000, mz800.rom1);
+    mem_map_ram(&mz800.mem, 0, 0x1000, 0x1000, mz800.dram1);
+    mem_map_ram(&mz800.mem, 0, 0x2000, 0x6000, dump_mz800_dram2); // 'load' custom program
+    mem_map_ram(&mz800.mem, 0, 0x8000, 0x4000, mz800.dram3);
+    mem_map_ram(&mz800.mem, 0, 0xc000, 0x2000, mz800.dram4);
+    mem_map_rom(&mz800.mem, 0, 0xe000, 0x2000, mz800.rom2);
+}
+
+/**
+ Updates the memory mapping for the bank switch IO requests.
+
+ @param pins Z80 pins with IO request for bank switching.
+ */
+void mz800_update_memory_mapping(uint64_t pins) {
+    if (pins & mz800_mem_banks[0]) {
+        mem_map_rom(&mz800.mem, 0, 0x1000, 0x1000, mz800.cgrom);
+        mem_map_ram(&mz800.mem, 0, 0x8000, 0x4000, mz800.vram);
+    } else if (pins & mz800_mem_banks[1]) {
+        mem_map_ram(&mz800.mem, 0, 0x1000, 0x1000, mz800.dram1);
+        mem_map_ram(&mz800.mem, 0, 0x8000, 0x4000, mz800.dram3);
+    } else if (pins & mz800_mem_banks[2]) {
+        mem_map_ram(&mz800.mem, 0, 0x0000, 0x1000, mz800.dram0);
+        mem_map_ram(&mz800.mem, 0, 0x1000, 0x1000, mz800.dram1);
+    } else if (pins & mz800_mem_banks[3]) {
+        mem_map_ram(&mz800.mem, 0, 0xe000, 0x2000, mz800.dram5);
+    } else if (pins & mz800_mem_banks[4]) {
+        mem_map_rom(&mz800.mem, 0, 0x0000, 0x1000, mz800.rom1);
+    } else if (pins & mz800_mem_banks[5]) {
+        mem_map_rom(&mz800.mem, 0, 0xe000, 0x2000, mz800.rom2);
+    } else if (pins & mz800_mem_banks[6]) {
+        mem_map_rom(&mz800.mem, 0, 0x0000, 0x1000, mz800.rom1);
+        mem_map_rom(&mz800.mem, 0, 0x1000, 0x1000, mz800.cgrom);
+        mem_map_ram(&mz800.mem, 0, 0x8000, 0x4000, mz800.vram);
+        mem_map_rom(&mz800.mem, 0, 0xe000, 0x2000, mz800.rom2);
+    } else if (pins & mz800_mem_banks[7]) {
+        // PROHIBIT not implemented
+    } else if (pins & mz800_mem_banks[8]) {
+        // RETURN not implemented
+    }
+    
+}
+
+uint64_t mz800_cpu_tick(int num_ticks, uint64_t pins) {
+    uint64_t out_pins = pins;
+    
+    // TODO: interrupt acknowledge
+    
+    // Memory request
+    if (pins & Z80_MREQ) {
+        const uint16_t addr = Z80_GET_ADDR(pins);
+        if (pins & Z80_RD) {
+            Z80_SET_DATA(out_pins, mem_rd(&mz800.mem, addr));
+        }
+        else if (pins & Z80_WR) {
+            mem_wr(&mz800.mem, addr, Z80_GET_DATA(pins));
+        }
+    }
+    
+    // IO request
+    if ((pins & Z80_IORQ) && (pins & (Z80_RD|Z80_WR))) {
+        out_pins = mz800_cpu_iorq(pins);
+    }
+
+    return out_pins;
+}
+
+uint64_t mz800_cpu_iorq(uint64_t pins) {
+    uint16_t address = Z80_GET_ADDR(pins);
+    
+    // Memory bank switch
+    if(address & MEM_BANK_IO_ADDRESS) {
+        mz800_update_memory_mapping(pins);
+    }
+    
+    return pins;
 }
