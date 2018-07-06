@@ -20,20 +20,31 @@
 #include <ctype.h> /* isupper, islower, toupper, tolower */
 
 /* MZ-800 emulator state and callbacks */
-#define MZ800_FREQ (4000000)
+#define MZ800_FREQ (3546895) // 3.546895 MHz
 #define MZ800_DISP_WIDTH (640)
 #define MZ800_DISP_HEIGHT (200)
 
 typedef struct {
-    z80_t cpu;
     
+    // CPU Z80A
+    z80_t cpu;
     uint32_t tick_count;
     
+    // PPI i8255, keyboard and cassette driver
+    // CTC i8253, programmable counter/timer
+    // PIO Z80 PIO, parallel I/O unit
+    // PSG SN 76489 AN, sound generator
+    // GDG WHID 65040-032, CRT controller
+    
+    // CRT
     crt_t crt;
+    
+    // Keyboard
     kbd_t kbd;
     
     // Memory
     mem_t mem;
+    
     // ROM
     uint8_t rom1[0x1000];  // 0x0000-0x0fff
     uint8_t cgrom[0x1000]; // 0x1000-0x1fff
@@ -72,7 +83,6 @@ const uint32_t mz800_mem_banks[9] = {
     O(0xe5), // | x      | x      | x      | PROHIB | // Prohibited
     O(0xe6)  // | x      | x      | x      | RETURN | // Return to previous state
 };
-#define MEM_BANK_IO_ADDRESS ((uint16_t)0xE7)
 
 /// Colors - the MZ-800 has 16 fixed colors.
 const uint32_t mz800_colors[16] = {
@@ -100,6 +110,8 @@ const uint32_t mz800_colors[16] = {
 uint32_t overrun_ticks;
 uint64_t last_time_stamp;
 
+// MARK: - Function declarations
+
 void mz800_init(void);
 void mz800_init_memory_mapping(void);
 void mz800_update_memory_mapping(uint64_t pins);
@@ -112,6 +124,9 @@ void app_frame(void);
 void app_input(const sapp_event*);
 void app_cleanup(void);
 
+
+// MARK: - Main
+
 sapp_desc sokol_main(int argc, char* argv[]) {
     return (sapp_desc) {
         .init_cb = app_init,
@@ -123,6 +138,9 @@ sapp_desc sokol_main(int argc, char* argv[]) {
         .window_title = "MZ-800"
     };
 }
+
+
+// MARK: - App
 
 /* one-time application init */
 void app_init() {
@@ -156,6 +174,8 @@ void app_cleanup() {
     gfx_shutdown();
 }
 
+// MARK: - MZ-800 specific functions
+
 void mz800_init(void) {
     mz800.tick_count = 0;
     
@@ -185,32 +205,32 @@ void mz800_init_memory_mapping(void) {
  @param pins Z80 pins with IO request for bank switching.
  */
 void mz800_update_memory_mapping(uint64_t pins) {
-    if (pins & mz800_mem_banks[0]) {
+    uint64_t pins_to_check = pins & (Z80_RD | Z80_WR | Z80_IORQ | 0xff);
+    if (pins_to_check == mz800_mem_banks[0]) {
         mem_map_rom(&mz800.mem, 0, 0x1000, 0x1000, mz800.cgrom);
         mem_map_ram(&mz800.mem, 0, 0x8000, 0x4000, mz800.vram);
-    } else if (pins & mz800_mem_banks[1]) {
+    } else if (pins_to_check == mz800_mem_banks[1]) {
         mem_map_ram(&mz800.mem, 0, 0x1000, 0x1000, mz800.dram1);
         mem_map_ram(&mz800.mem, 0, 0x8000, 0x4000, mz800.dram3);
-    } else if (pins & mz800_mem_banks[2]) {
+    } else if (pins_to_check == mz800_mem_banks[2]) {
         mem_map_ram(&mz800.mem, 0, 0x0000, 0x1000, mz800.dram0);
         mem_map_ram(&mz800.mem, 0, 0x1000, 0x1000, mz800.dram1);
-    } else if (pins & mz800_mem_banks[3]) {
+    } else if (pins_to_check == mz800_mem_banks[3]) {
         mem_map_ram(&mz800.mem, 0, 0xe000, 0x2000, mz800.dram5);
-    } else if (pins & mz800_mem_banks[4]) {
+    } else if (pins_to_check == mz800_mem_banks[4]) {
         mem_map_rom(&mz800.mem, 0, 0x0000, 0x1000, mz800.rom1);
-    } else if (pins & mz800_mem_banks[5]) {
+    } else if (pins_to_check == mz800_mem_banks[5]) {
         mem_map_rom(&mz800.mem, 0, 0xe000, 0x2000, mz800.rom2);
-    } else if (pins & mz800_mem_banks[6]) {
+    } else if (pins_to_check == mz800_mem_banks[6]) {
         mem_map_rom(&mz800.mem, 0, 0x0000, 0x1000, mz800.rom1);
         mem_map_rom(&mz800.mem, 0, 0x1000, 0x1000, mz800.cgrom);
         mem_map_ram(&mz800.mem, 0, 0x8000, 0x4000, mz800.vram);
         mem_map_rom(&mz800.mem, 0, 0xe000, 0x2000, mz800.rom2);
-    } else if (pins & mz800_mem_banks[7]) {
+    } else if (pins_to_check == mz800_mem_banks[7]) {
         // PROHIBIT not implemented
-    } else if (pins & mz800_mem_banks[8]) {
+    } else if (pins_to_check == mz800_mem_banks[8]) {
         // RETURN not implemented
     }
-    
 }
 
 uint64_t mz800_cpu_tick(int num_ticks, uint64_t pins) {
@@ -237,12 +257,54 @@ uint64_t mz800_cpu_tick(int num_ticks, uint64_t pins) {
     return out_pins;
 }
 
+#define IN_RANGE(A,B,C) (((A)>=(B))&&((A)<=(C)))
+
 uint64_t mz800_cpu_iorq(uint64_t pins) {
-    uint16_t address = Z80_GET_ADDR(pins);
+    uint16_t address = Z80_GET_ADDR(pins) & 0xff;
     
-    // Memory bank switch
-    if(address & MEM_BANK_IO_ADDRESS) {
+    // Serial I/O
+    if (IN_RANGE(address, 0xb0, 0xb3)) {
+        // TODO: not implemented
+    }
+    // GDG WHID 65040-032, CRT controller
+    else if (IN_RANGE(address, 0xcc, 0xcf)) {
+        // TODO: not implemented
+    }
+    // PPI i8255, keyboard and cassette driver
+    else if (IN_RANGE(address, 0xd0, 0xd3)) {
+        // TODO: not implemented
+    }
+    // CTC i8253, programmable counter/timer
+    else if (IN_RANGE(address, 0xd4, 0xd7)) {
+        // TODO: not implemented
+    }
+    // FDC, floppy disc controller
+    else if (IN_RANGE(address, 0xd8, 0xdf)) {
+        // TODO: not implemented
+    }
+    // GDG WHID 65040-032, Memory bank switch
+    else if (IN_RANGE(address, 0xe0, 0xe6)) {
         mz800_update_memory_mapping(pins);
+    }
+    // Joystick
+    else if (IN_RANGE(address, 0xf0, 0xf1)) {
+        // TODO: not implemented
+    }
+    // PSG SN 76489 AN, sound generator
+    else if (address == 0xf2) {
+        // TODO: not implemented
+    }
+    // QDC, quick disk controller
+    else if (IN_RANGE(address, 0xf4, 0xf7)) {
+        // TODO: not implemented
+    }
+    // PIO Z80 PIO, parallel I/O unit
+    else if (IN_RANGE(address, 0xfc, 0xff)) {
+        // TODO: not implemented
+    }
+    // DEBUG
+    else {
+        assert(1);
     }
     
     return pins;
