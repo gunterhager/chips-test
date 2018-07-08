@@ -34,7 +34,9 @@ typedef struct {
     // CTC i8253, programmable counter/timer
     // PIO Z80 PIO, parallel I/O unit
     // PSG SN 76489 AN, sound generator
+    
     // GDG WHID 65040-032, CRT controller
+    gdg_whid65040_032_t gdg;
     
     // CRT
     crt_t crt;
@@ -260,7 +262,7 @@ uint64_t mz800_cpu_tick(int num_ticks, uint64_t pins) {
 #define IN_RANGE(A,B,C) (((A)>=(B))&&((A)<=(C)))
 
 uint64_t mz800_cpu_iorq(uint64_t pins) {
-    uint16_t address = Z80_GET_ADDR(pins) & 0xff;
+    uint16_t address = Z80_GET_ADDR(pins) & 0xff; // check only the lower byte of the address
     
     // Serial I/O
     if (IN_RANGE(address, 0xb0, 0xb3)) {
@@ -268,7 +270,7 @@ uint64_t mz800_cpu_iorq(uint64_t pins) {
     }
     // GDG WHID 65040-032, CRT controller
     else if (IN_RANGE(address, 0xcc, 0xcf)) {
-        // TODO: not implemented
+        gdg_whid65040_032_iorq(&mz800.gdg, pins);
     }
     // PPI i8255, keyboard and cassette driver
     else if (IN_RANGE(address, 0xd0, 0xd3)) {
@@ -284,6 +286,8 @@ uint64_t mz800_cpu_iorq(uint64_t pins) {
     }
     // GDG WHID 65040-032, Memory bank switch
     else if (IN_RANGE(address, 0xe0, 0xe6)) {
+        // Currently this isn't supported by the GDG emulation,
+        // so we do the bank switch directly here.
         mz800_update_memory_mapping(pins);
     }
     // Joystick
@@ -304,7 +308,7 @@ uint64_t mz800_cpu_iorq(uint64_t pins) {
     }
     // DEBUG
     else {
-        assert(1);
+        CHIPS_ASSERT(1);
     }
     
     return pins;
